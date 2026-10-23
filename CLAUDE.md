@@ -43,6 +43,7 @@ tailscale serve  ──►  FastAPI app (127.0.0.1:8000)
 | `LLM_MODEL` | `qwen3-4b-instruct` | Model name as the LLM server knows it |
 | `API_KEY` | random string | Required in the `X-API-Key` header for `/chat` |
 | `MAX_HISTORY_TURNS` | `6` | Turns of history kept per session |
+| `STT_BASE_URL` | `http://127.0.0.1:8081` | whisper-server (whisper.cpp) for `/stt` |
 
 Model size by Mac RAM (quantized): 8 GB → 3–4B; 16 GB+ → 7–8B. This Mac (M1, 8 GB) runs Qwen3-4B-Instruct-2507 Q4_K_M at about 14 tok/s. Qwen2.5-3B was tested first and stated wrong grammar rules, so don't go below 4B. Use a non-thinking (instruct) model, or `<think>` text reaches users.
 
@@ -50,7 +51,7 @@ Commit `.env.example`, never `.env`.
 
 ## API contract
 
-**`GET /health`** → `200 {"status": "ok", "model": "<LLM_MODEL>", "llm_reachable": true|false}`
+**`GET /health`** → `200 {"status": "ok", "model": "<LLM_MODEL>", "llm_reachable": true|false, "stt_reachable": true|false}`
 No API key required. Must respond even if the LLM server is down (`llm_reachable: false`).
 
 **`POST /chat`** (header `X-API-Key`)
@@ -66,6 +67,8 @@ Request:
 - `stream: false` → `{"answer": "...", "session_id": "..."}`.
 
 Errors: `401` bad key, `422` invalid body, `503` LLM unreachable or failed before the first token (`{"detail": "<readable message>"}`, never a stack trace).
+
+**`POST /stt`** (header `X-API-Key`): the raw audio file is the request body, `Content-Type: audio/wav` or `audio/mpeg`, max 5 MB → `{"text": "..."}`. Raw body instead of multipart keeps `python-multipart` out. Errors: `400` unreadable audio, `401`, `413` too large, `415` wrong type, `422` empty body, `503` whisper-server down or timed out. Clients chain `/stt` → `/chat` themselves.
 
 ## Bot behavior (system prompt)
 
@@ -87,11 +90,13 @@ app/
   sessions.py    # in-memory session history (LRU dict, max 500 sessions), trimmed to MAX_HISTORY_TURNS
   prompts.py     # system prompt builder by level
   security.py    # X-API-Key check
+  stt.py         # async client for whisper-server /inference
 static/
   index.html     # single page: input, level picker, streamed answer
 tests/
   test_health.py
   test_chat.py   # LLM mocked
+  test_stt.py    # whisper mocked
 conftest.py      # sets a test API_KEY, puts the root on sys.path
 .env.example
 .gitignore
@@ -115,6 +120,12 @@ cp .env.example .env   # then edit
 # The llama.cpp source carries a one-line patch: macOS 13 can't do Metal's async tensor read, so
 # ggml/src/ggml-metal/ggml-metal.cpp sets .get_tensor_async = NULL (grep "grammarbot patch"). Re-apply it after
 # updating the source, then: cmake --build ~/.local/llama.cpp/build --target llama-server -j
+
+# speech to text (whisper.cpp v1.9.5, Metal, same "grammarbot patch" in its ggml copy).
+# large-v3-turbo q5_0 handles Vietnamese well; a short clip takes ~5-8 s on this Mac.
+~/.local/whisper.cpp/build/bin/whisper-server -m ~/models/ggml-large-v3-turbo-q5_0.bin \
+  --host 127.0.0.1 --port 8081 -l auto -nt
+# rebuild: cmake --build ~/.local/whisper.cpp/build --target whisper-server -j
 
 # run app
 uvicorn app.main:app --host 127.0.0.1 --port 8000
@@ -150,7 +161,8 @@ caffeinate -dims
 
 Write `README.md` with: the tailnet URL placeholder, how to get the API key from us, `curl` examples for `/health` and `/chat` (streaming and non-streaming), and the request/response formats above.
 
-## Phase 2 (only after the above is done)
+## Phase 2
 
-- `POST /stt`: accept a short WAV/MP3 upload, return text, using whisper.cpp or sherpa-onnx locally. Then optionally chain `/stt` → `/chat`.
+- Done: `POST /stt` via whisper.cpp `whisper-server` (see API contract). Chaining is left to clients.
+- Possible speed-up: per-request `audio_ctx=512` cut a 7.5 s clip from ~8 s to ~2.4 s, but needs the clip length (stdlib `wave` for WAV only) and 256 made the model repeat itself. Not done; timings on this RAM-starved Mac were too noisy to trust.
 - Later: RAG over curated grammar notes, Docker image for the partner's edge hardware.

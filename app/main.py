@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import time
@@ -6,12 +7,12 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, StringConstraints
 
-from app import llm, sessions
+from app import llm, sessions, stt
 from app.config import LLM_MODEL
 from app.prompts import system_prompt
 from app.security import require_api_key
@@ -22,11 +23,15 @@ log = logging.getLogger("grammarbot")
 
 app = FastAPI(title="Grammar Bot")
 
+AUDIO_TYPES = {"audio/wav", "audio/x-wav", "audio/wave", "audio/mpeg", "audio/mp3"}
+MAX_AUDIO_BYTES = 5 * 1024 * 1024  # about 30 s of CD-quality WAV; whisper must finish within 60 s
+
 
 class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
     model: str
     llm_reachable: bool
+    stt_reachable: bool
 
 
 class ChatRequest(BaseModel):
@@ -41,6 +46,10 @@ class ChatResponse(BaseModel):
     session_id: str
 
 
+class STTResponse(BaseModel):
+    text: str
+
+
 def _log(session_id: str, level: str, started: float, status: int | str) -> None:
     latency = time.perf_counter() - started
     log.info("chat session=%s level=%s status=%s latency=%.2fs", session_id, level, status, latency)
@@ -52,7 +61,32 @@ def _sse(payload: dict[str, object]) -> str:
 
 @app.get("/health")
 async def health() -> HealthResponse:
-    return HealthResponse(model=LLM_MODEL, llm_reachable=await llm.is_reachable())
+    llm_up, stt_up = await asyncio.gather(llm.is_reachable(), stt.is_reachable())
+    return HealthResponse(model=LLM_MODEL, llm_reachable=llm_up, stt_reachable=stt_up)
+
+
+@app.post("/stt", dependencies=[Depends(require_api_key)])
+async def speech_to_text(request: Request) -> STTResponse:
+    # Raw audio body instead of multipart: no python-multipart dependency, and `curl --data-binary` is enough.
+    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if content_type not in AUDIO_TYPES:
+        raise HTTPException(status_code=415, detail="Send the audio as the request body with Content-Type audio/wav or audio/mpeg.")
+    audio = bytearray()
+    async for chunk in request.stream():
+        audio += chunk
+        if len(audio) > MAX_AUDIO_BYTES:
+            raise HTTPException(status_code=413, detail="Audio is too large: keep clips under 5 MB (about 30 seconds).")
+    if not audio:
+        raise HTTPException(status_code=422, detail="The request body is empty.")
+
+    started = time.perf_counter()
+    try:
+        text = await stt.transcribe(bytes(audio), content_type)
+    except stt.STTError as e:
+        log.info("stt bytes=%d status=%d latency=%.2fs", len(audio), e.status_code, time.perf_counter() - started)
+        raise HTTPException(status_code=e.status_code, detail=str(e)) from e
+    log.info("stt bytes=%d status=200 latency=%.2fs", len(audio), time.perf_counter() - started)
+    return STTResponse(text=text)
 
 
 @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(require_api_key)])

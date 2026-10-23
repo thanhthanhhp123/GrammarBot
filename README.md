@@ -1,13 +1,13 @@
 # Grammar Bot
 
-A small service that answers English grammar questions in English or Vietnamese. It runs on our Mac and is reachable only inside our Tailscale network (tailnet).
+A small service that answers English grammar questions in English or Vietnamese, and can turn a spoken question into text first. It runs on our Mac and is reachable only inside our Tailscale network (tailnet).
 
 **Base URL:** `https://<mac-name>.<tailnet>.ts.net` (we'll send you the exact name)
 
 ## Access
 
 1. Your device must be in our tailnet, or we must share the Mac's node with your Tailscale account. Without that, the URL won't resolve.
-2. `POST /chat` needs an API key in the `X-API-Key` header. We'll send it to you privately (not by email or in a shared channel). Don't put it in code that's committed to a repo.
+2. `POST /chat` and `POST /stt` need an API key in the `X-API-Key` header. We'll send it to you privately (not by email or in a shared channel). Don't put it in code that's committed to a repo.
 
 In the examples below, set these first:
 
@@ -25,10 +25,10 @@ curl $BASE/health
 ```
 
 ```json
-{"status": "ok", "model": "qwen3-4b-instruct", "llm_reachable": true}
+{"status": "ok", "model": "qwen3-4b-instruct", "llm_reachable": true, "stt_reachable": true}
 ```
 
-`llm_reachable: false` means the service is up but its language model is down, so `/chat` will return `503` until it's back.
+`llm_reachable: false` means the service is up but its language model is down, so `/chat` will return `503` until it's back. `stt_reachable: false` means the same for speech-to-text and `/stt`.
 
 ## `POST /chat`
 
@@ -83,15 +83,38 @@ data: {"done": true, "session_id": "3f2a9c..."}
 
 Join the `delta` strings to build the answer. The last event is either `{"done": true, "session_id": ...}` or, if the model fails partway through, `{"error": "<message>"}`.
 
+## `POST /stt`
+
+Turns a short spoken question (WAV or MP3, English or Vietnamese) into text. Send the audio file itself as the request body, with `Content-Type: audio/wav` or `audio/mpeg`:
+
+```bash
+curl $BASE/stt \
+  -H "X-API-Key: $KEY" -H "Content-Type: audio/wav" \
+  --data-binary @question.wav
+```
+
+```json
+{"text": "Khi nào dùng thì hiện tại hoàn thành?"}
+```
+
+- Any sample rate, mono or stereo. The language is detected automatically.
+- Keep clips under about 30 seconds (5 MB max). A short clip takes about 5–8 seconds to transcribe.
+- Use `--data-binary`, not `-d` or `-F`: the body must be the raw file, not a form.
+
+To ask by voice, send the `text` you get back as the `message` of a `POST /chat` request.
+
 ## Errors
 
 Errors are JSON with a readable `detail`:
 
 | Status | Meaning |
 | --- | --- |
+| `400` | `/stt`: the body isn't readable WAV or MP3 audio |
 | `401` | Missing or wrong `X-API-Key` |
-| `422` | Invalid request body (for example empty `message`, unknown `level`) |
-| `503` | The language model is down or timed out. Try again shortly |
+| `413` | `/stt`: audio larger than 5 MB |
+| `415` | `/stt`: `Content-Type` isn't `audio/wav` or `audio/mpeg` |
+| `422` | Invalid request body (for example empty `message`, unknown `level`, empty audio) |
+| `503` | The language model or speech-to-text server is down or timed out. Try again shortly |
 
 ```json
 {"detail": "The language model server is not reachable."}
@@ -115,18 +138,22 @@ pip install -r requirements.txt
 cp .env.example .env   # set API_KEY; LLM_BASE_URL matches the LLM server below
 ```
 
-Each demo, in three terminals:
+Each demo, in four terminals:
 
 ```bash
 # 1. LLM server (llama.cpp, Metal GPU)
 ~/.local/llama.cpp/build/bin/llama-server -m ~/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf \
   --host 127.0.0.1 --port 8080 -c 8192 -ngl 99 --alias qwen3-4b-instruct --load-mode mmap+mlock
 
-# 2. App
+# 2. Speech-to-text server (whisper.cpp, Metal GPU)
+~/.local/whisper.cpp/build/bin/whisper-server -m ~/models/ggml-large-v3-turbo-q5_0.bin \
+  --host 127.0.0.1 --port 8081 -l auto -nt
+
+# 3. App
 source .venv/bin/activate && uvicorn app.main:app --host 127.0.0.1 --port 8000
 
-# 3. Tailnet exposure + keep the Mac awake (keep the lid open and the charger in)
-tailscale serve --bg 8000
+# 4. Tailnet exposure + keep the Mac awake (keep the lid open and the charger in)
+tailscale serve --bg 8000   # once; the config survives restarts
 caffeinate -dims
 ```
 
