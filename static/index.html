@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Grammar Bot</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fff; --muted: #6e6e73; --line: #d2d2d7; --accent: #0a66c2; --card: #f5f5f7; --error: #c62828; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #f5f5f7; --bg: #111; --muted: #a1a1a6; --line: #3a3a3c; --accent: #4ea1ff; --card: #1c1c1e; --error: #ff6b6b; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+  main { max-width: 720px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 1.4rem; margin: 0 0 12px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  label { font-size: .9rem; color: var(--muted); }
+  input, select, button { font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); }
+  #message { flex: 1; min-width: 0; }
+  button { background: var(--accent); border-color: var(--accent); color: #fff; cursor: pointer; }
+  button.secondary { background: transparent; color: var(--fg); border-color: var(--line); }
+  button:disabled { opacity: .5; cursor: default; }
+  #log { display: flex; flex-direction: column; gap: 12px; margin-top: 16px; }
+  .q { font-weight: 600; }
+  .a { background: var(--card); border-radius: 10px; padding: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .error { color: var(--error); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Grammar Bot</h1>
+  <div class="row">
+    <label for="key">API key</label>
+    <input id="key" type="password" autocomplete="off" placeholder="X-API-Key">
+    <label for="level">Level</label>
+    <select id="level">
+      <option value="beginner">Beginner</option>
+      <option value="intermediate">Intermediate</option>
+      <option value="advanced">Advanced</option>
+    </select>
+    <button id="reset" type="button" class="secondary">New conversation</button>
+  </div>
+  <form id="form" class="row">
+    <input id="message" aria-label="Question" maxlength="2000" required placeholder="When do I use present perfect?">
+    <button id="send">Ask</button>
+  </form>
+  <div id="log" aria-live="polite"></div>
+</main>
+<script>
+  const $ = (id) => document.getElementById(id);
+  let sessionId = null;
+
+  // The key is remembered in this browser only; it is never part of the page.
+  try { $("key").value = localStorage.getItem("apiKey") || ""; } catch {}
+  $("key").addEventListener("change", () => { try { localStorage.setItem("apiKey", $("key").value); } catch {} });
+  $("reset").addEventListener("click", () => { sessionId = null; $("log").replaceChildren(); $("message").focus(); });
+
+  function add(cls, text) {
+    const el = document.createElement("div");
+    el.className = cls;
+    el.textContent = text;
+    $("log").append(el);
+    return el;
+  }
+
+  async function ask(message, answer) {
+    const res = await fetch("/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-API-Key": $("key").value },
+      body: JSON.stringify({ message, level: $("level").value, session_id: sessionId, stream: true }),
+    });
+    if (!res.ok) {
+      const { detail } = await res.json().catch(() => ({}));
+      throw new Error(Array.isArray(detail) ? detail[0].msg : detail || `HTTP ${res.status}`);
+    }
+    // EventSource can't POST, so read the SSE stream by hand: events are separated by a blank line.
+    const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      buffer += value;
+      const events = buffer.split("\n\n");
+      buffer = events.pop();
+      for (const event of events) {
+        if (!event.startsWith("data: ")) continue;
+        const data = JSON.parse(event.slice(6));
+        if (data.delta) answer.textContent += data.delta;
+        if (data.done) sessionId = data.session_id;
+        if (data.error) throw new Error(data.error);
+      }
+    }
+  }
+
+  $("form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const message = $("message").value.trim();
+    if (!message) return;
+    $("message").value = "";
+    $("send").disabled = true;
+    add("q", message);
+    const answer = add("a", "");
+    try {
+      await ask(message, answer);
+    } catch (err) {
+      add("error", err.message);
+    } finally {
+      $("send").disabled = false;
+      $("message").focus();
+    }
+  });
+</script>
+</body>
+</html>
