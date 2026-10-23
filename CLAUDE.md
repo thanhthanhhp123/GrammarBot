@@ -68,7 +68,7 @@ Request:
 
 Errors: `401` bad key, `422` invalid body, `503` LLM unreachable or failed before the first token (`{"detail": "<readable message>"}`, never a stack trace).
 
-**`POST /stt`** (header `X-API-Key`): the raw audio file is the request body, `Content-Type: audio/wav` or `audio/mpeg`, max 5 MB → `{"text": "..."}`. Raw body instead of multipart keeps `python-multipart` out. Errors: `400` unreadable audio, `401`, `413` too large, `415` wrong type, `422` empty body, `503` whisper-server down or timed out. Clients chain `/stt` → `/chat` themselves.
+**`POST /stt`** (header `X-API-Key`): the raw audio file is the request body, `Content-Type: audio/wav` or `audio/mpeg`, max 5 MB → `{"text": "..."}` (`""` when there is no speech). Raw body instead of multipart keeps `python-multipart` out. Errors: `400` unreadable audio, `401`, `413` too large, `415` wrong type, `422` empty body, `503` whisper-server down or timed out. Clients chain `/stt` → `/chat` themselves.
 
 ## Bot behavior (system prompt)
 
@@ -92,7 +92,7 @@ app/
   security.py    # X-API-Key check
   stt.py         # async client for whisper-server /inference
 static/
-  index.html     # single page: input, level picker, streamed answer
+  index.html     # single page: input, level picker, mic button (records → 16 kHz WAV → /stt → /chat), streamed answer
 tests/
   test_health.py
   test_chat.py   # LLM mocked
@@ -124,7 +124,8 @@ cp .env.example .env   # then edit
 # speech to text (whisper.cpp v1.9.5, Metal, same "grammarbot patch" in its ggml copy).
 # large-v3-turbo q5_0 handles Vietnamese well; a short clip takes ~5-8 s on this Mac.
 ~/.local/whisper.cpp/build/bin/whisper-server -m ~/models/ggml-large-v3-turbo-q5_0.bin \
-  --host 127.0.0.1 --port 8081 -l auto -nt
+  --host 127.0.0.1 --port 8081 -l auto -nt --vad -vm ~/models/ggml-silero-v6.2.0.bin
+# --vad (Silero) skips non-speech; without it Whisper turns silence into "you" or "."
 # rebuild: cmake --build ~/.local/whisper.cpp/build --target whisper-server -j
 
 # run app

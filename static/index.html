@@ -18,6 +18,7 @@
   button { background: var(--accent); border-color: var(--accent); color: #fff; cursor: pointer; }
   button.secondary { background: transparent; color: var(--fg); border-color: var(--line); }
   button:disabled { opacity: .5; cursor: default; }
+  button.recording { background: var(--error); border-color: var(--error); color: #fff; }
   #log { display: flex; flex-direction: column; gap: 12px; margin-top: 16px; }
   .q { font-weight: 600; }
   .a { background: var(--card); border-radius: 10px; padding: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -40,6 +41,7 @@
   </div>
   <form id="form" class="row">
     <input id="message" aria-label="Question" maxlength="2000" required placeholder="When do I use present perfect?">
+    <button id="mic" type="button" class="secondary" aria-pressed="false">🎤 Speak</button>
     <button id="send">Ask</button>
   </form>
   <div id="log" aria-live="polite"></div>
@@ -61,16 +63,18 @@
     return el;
   }
 
+  async function fail(res) {
+    const { detail } = await res.json().catch(() => ({}));
+    throw new Error(Array.isArray(detail) ? detail[0].msg : detail || `HTTP ${res.status}`);
+  }
+
   async function ask(message, answer) {
     const res = await fetch("/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-API-Key": $("key").value },
       body: JSON.stringify({ message, level: $("level").value, session_id: sessionId, stream: true }),
     });
-    if (!res.ok) {
-      const { detail } = await res.json().catch(() => ({}));
-      throw new Error(Array.isArray(detail) ? detail[0].msg : detail || `HTTP ${res.status}`);
-    }
+    if (!res.ok) await fail(res);
     // EventSource can't POST, so read the SSE stream by hand: events are separated by a blank line.
     const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
     let buffer = "";
@@ -90,12 +94,8 @@
     }
   }
 
-  $("form").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const message = $("message").value.trim();
-    if (!message) return;
-    $("message").value = "";
-    $("send").disabled = true;
+  async function submit(message) {
+    $("send").disabled = $("mic").disabled = true;
     add("q", message);
     const answer = add("a", "");
     try {
@@ -104,8 +104,86 @@
       add("error", err.message);
     } finally {
       $("send").disabled = false;
+      $("mic").disabled = !micSupported;
       $("message").focus();
     }
+  }
+
+  $("form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const message = $("message").value.trim();
+    $("message").value = "";
+    if (message) submit(message);
+  });
+
+  // --- Voice: record, convert to 16 kHz mono WAV (what /stt accepts), transcribe, then ask. ---
+  const MAX_RECORDING_MS = 30000; // /stt is meant for clips up to about 30 s
+  const micSupported = Boolean(navigator.mediaDevices?.getUserMedia && window.MediaRecorder);
+  let recorder = null;
+  if (!micSupported) {
+    $("mic").disabled = true;
+    $("mic").title = "The microphone needs HTTPS: open the page through its ts.net address";
+  }
+
+  function setMic(label, { busy = false, recording = false } = {}) {
+    $("mic").textContent = label;
+    $("mic").disabled = busy;
+    $("mic").classList.toggle("recording", recording);
+    $("mic").setAttribute("aria-pressed", String(recording));
+  }
+
+  async function toWav(blob) {
+    const RATE = 16000;
+    // Decoding in a 16 kHz context also resamples; the first channel is enough for speech.
+    const audio = await new OfflineAudioContext(1, 1, RATE).decodeAudioData(await blob.arrayBuffer());
+    const pcm = audio.getChannelData(0);
+    // 44-byte header for 16-bit mono PCM, then the samples.
+    const view = new DataView(new ArrayBuffer(44 + pcm.length * 2));
+    const ascii = (offset, s) => [...s].forEach((c, i) => view.setUint8(offset + i, c.charCodeAt(0)));
+    ascii(0, "RIFF"); view.setUint32(4, 36 + pcm.length * 2, true); ascii(8, "WAVE");
+    ascii(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+    view.setUint32(24, RATE, true); view.setUint32(28, RATE * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+    ascii(36, "data"); view.setUint32(40, pcm.length * 2, true);
+    pcm.forEach((sample, i) => view.setInt16(44 + i * 2, Math.max(-1, Math.min(1, sample)) * 0x7fff, true));
+    return new Blob([view], { type: "audio/wav" });
+  }
+
+  async function transcribe(wav) {
+    const res = await fetch("/stt", { method: "POST", headers: { "Content-Type": "audio/wav", "X-API-Key": $("key").value }, body: wav });
+    if (!res.ok) await fail(res);
+    return (await res.json()).text;
+  }
+
+  $("mic").addEventListener("click", async () => {
+    if (recorder) return recorder.stop();
+    let stream;
+    setMic("Starting…", { busy: true }); // the permission prompt and mic startup can take a second or two
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      setMic("🎤 Speak");
+      return add("error", `Microphone unavailable: ${err.message}`);
+    }
+    const chunks = [];
+    const rec = (recorder = new MediaRecorder(stream));
+    rec.ondataavailable = (e) => chunks.push(e.data);
+    rec.onstop = async () => {
+      stream.getTracks().forEach((track) => track.stop()); // releases the mic indicator
+      recorder = null;
+      setMic("Transcribing…", { busy: true });
+      try {
+        const text = await transcribe(await toWav(new Blob(chunks, { type: rec.mimeType })));
+        if (!text) throw new Error("Didn't catch any speech. Try again, a bit closer to the mic.");
+        await submit(text);
+      } catch (err) {
+        add("error", err.message);
+      } finally {
+        setMic("🎤 Speak");
+      }
+    };
+    rec.start();
+    setMic("■ Stop", { recording: true });
+    setTimeout(() => rec.state === "recording" && rec.stop(), MAX_RECORDING_MS);
   });
 </script>
 </body>

@@ -98,6 +98,7 @@ curl $BASE/stt \
 ```
 
 - Any sample rate, mono or stereo. The language is detected automatically.
+- `text` is `""` when the clip has no speech (silence or noise).
 - Keep clips under about 30 seconds (5 MB max). A short clip takes about 5–8 seconds to transcribe.
 - Use `--data-binary`, not `-d` or `-F`: the body must be the raw file, not a form.
 
@@ -124,7 +125,7 @@ Answers usually take a few seconds; requests time out after 60 seconds. Conversa
 
 ## Web page
 
-Open `$BASE/` in a browser on a tailnet device for a simple chat page. Enter the API key once; it's remembered in that browser.
+Open `$BASE/` in a browser on a tailnet device for a simple chat page. Enter the API key once; it's remembered in that browser. Press **🎤 Speak**, ask your question, then press **■ Stop**: the page transcribes it and asks the bot. The microphone only works over the `https://…ts.net` address.
 
 ---
 
@@ -147,7 +148,7 @@ Each demo, in four terminals:
 
 # 2. Speech-to-text server (whisper.cpp, Metal GPU)
 ~/.local/whisper.cpp/build/bin/whisper-server -m ~/models/ggml-large-v3-turbo-q5_0.bin \
-  --host 127.0.0.1 --port 8081 -l auto -nt
+  --host 127.0.0.1 --port 8081 -l auto -nt --vad -vm ~/models/ggml-silero-v6.2.0.bin
 
 # 3. App
 source .venv/bin/activate && uvicorn app.main:app --host 127.0.0.1 --port 8000
